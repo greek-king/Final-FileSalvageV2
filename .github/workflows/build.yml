@@ -1,0 +1,282 @@
+name: Build and Sign IPA
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+# Required for softprops/action-gh-release to create releases and upload assets.
+# Without this block, GITHUB_TOKEN defaults to read-only in most repo settings.
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-and-sign:
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Select Xcode 16
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.2.app
+          xcodebuild -version
+
+      - name: Install tools
+        run: |
+          brew install xcodegen ldid
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build .app for real device
+        run: |
+          xcodebuild \
+            -project FileSalvage.xcodeproj \
+            -scheme FileSalvage \
+            -destination 'generic/platform=iOS' \
+            -configuration Release \
+            -derivedDataPath $RUNNER_TEMP/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            build \
+            2>&1 | tee build.log
+          if grep -q "BUILD SUCCEEDED" build.log; then
+            echo "✅ Build succeeded"
+          else
+            echo "❌ Build failed"
+            cat build.log
+            exit 1
+          fi
+
+      - name: Find .app
+        run: |
+          APP=$(find $RUNNER_TEMP/DerivedData -name "FileSalvage.app" | grep -v simulator | head -1)
+          if [ -z "$APP" ]; then
+            APP=$(find $RUNNER_TEMP/DerivedData -name "FileSalvage.app" | head -1)
+          fi
+          echo "APP_PATH=$APP" >> $GITHUB_ENV
+          echo "Found: $APP"
+
+      - name: Sign with ldid
+        run: |
+          ldid -S "$APP_PATH/FileSalvage"
+          echo "✅ Signed"
+
+      - name: Package IPA
+        run: |
+          mkdir -p $RUNNER_TEMP/Payload
+          cp -r "$APP_PATH" $RUNNER_TEMP/Payload/FileSalvage.app
+          cd $RUNNER_TEMP
+          zip -r FileSalvage.ipa Payload/
+          echo "IPA_PATH=$RUNNER_TEMP/FileSalvage.ipa" >> $GITHUB_ENV
+          echo "✅ IPA: $(du -sh FileSalvage.ipa)"
+
+      - name: Upload IPA to release assets
+        run: |
+          mkdir -p $RUNNER_TEMP/release
+          cp $RUNNER_TEMP/FileSalvage.ipa $RUNNER_TEMP/release/FileSalvage.ipa
+
+      - name: Create OTA manifest (install.plist)
+        run: |
+          REPO="${{ github.repository }}"
+          BRANCH="${{ github.ref_name }}"
+          IPA_URL="https://github.com/${REPO}/releases/latest/download/FileSalvage.ipa"
+
+          cat > $RUNNER_TEMP/release/install.plist << PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>items</key>
+            <array>
+              <dict>
+                <key>assets</key>
+                <array>
+                  <dict>
+                    <key>kind</key>
+                    <string>software-package</string>
+                    <key>url</key>
+                    <string>${IPA_URL}</string>
+                  </dict>
+                </array>
+                <key>metadata</key>
+                <dict>
+                  <key>bundle-identifier</key>
+                  <string>com.yourcompany.filesalvage</string>
+                  <key>bundle-version</key>
+                  <string>1.0.0</string>
+                  <key>kind</key>
+                  <string>software</string>
+                  <key>title</key>
+                  <string>FileSalvage</string>
+                </dict>
+              </dict>
+            </array>
+          </dict>
+          </plist>
+          PLIST
+
+          echo "✅ install.plist created"
+
+      - name: Create install page (index.html)
+        run: |
+          REPO="${{ github.repository }}"
+          PLIST_URL="https://raw.githubusercontent.com/${REPO}/main/install.plist"
+
+          cat > $RUNNER_TEMP/release/index.html << HTML
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Install FileSalvage</title>
+            <style>
+              * { margin: 0; padding: 0; box-sizing: border-box; }
+              body {
+                background: #0A0000;
+                color: white;
+                font-family: -apple-system, sans-serif;
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                padding: 24px;
+              }
+              .icon {
+                width: 100px; height: 100px;
+                background: linear-gradient(135deg, #8B0000, #FF2020);
+                border-radius: 22px;
+                margin-bottom: 24px;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 48px;
+              }
+              h1 { font-size: 28px; font-weight: 900; margin-bottom: 8px;
+                   background: linear-gradient(90deg, #FF4444, #FF8080);
+                   -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+              p { color: rgba(255,100,100,0.6); font-size: 14px; margin-bottom: 32px; text-align: center; }
+              .btn {
+                background: linear-gradient(135deg, #8B0000, #FF2020);
+                color: white; border: none; padding: 18px 48px;
+                border-radius: 50px; font-size: 18px; font-weight: 900;
+                text-decoration: none; letter-spacing: 1px;
+                box-shadow: 0 0 30px rgba(255,32,32,0.4);
+                display: inline-block; margin-bottom: 20px;
+              }
+              .note {
+                color: rgba(255,100,100,0.4); font-size: 12px;
+                text-align: center; max-width: 280px; line-height: 1.6;
+              }
+              .steps {
+                background: rgba(255,32,32,0.05);
+                border: 1px solid rgba(255,32,32,0.15);
+                border-radius: 16px; padding: 20px;
+                margin-bottom: 32px; max-width: 320px; width: 100%;
+              }
+              .step { display: flex; gap: 12px; margin-bottom: 12px; align-items: flex-start; }
+              .step:last-child { margin-bottom: 0; }
+              .num {
+                background: rgba(255,32,32,0.2); color: #FF4444;
+                width: 24px; height: 24px; border-radius: 50%;
+                display: flex; align-items: center; justify-content: center;
+                font-size: 11px; font-weight: 900; flex-shrink: 0;
+              }
+              .step p { color: rgba(255,255,255,0.7); font-size: 13px; margin: 0; text-align: left; }
+            </style>
+          </head>
+          <body>
+            <div class="icon">🔴</div>
+            <h1>FileSalvage</h1>
+            <p>APFS Data Recovery for iPhone</p>
+
+            <div class="steps">
+              <div class="step">
+                <div class="num">1</div>
+                <p>Open this page in <strong>Safari</strong> on your iPhone</p>
+              </div>
+              <div class="step">
+                <div class="num">2</div>
+                <p>Tap <strong>Install App</strong> below</p>
+              </div>
+              <div class="step">
+                <div class="num">3</div>
+                <p>Go to <strong>Settings → General → VPN & Device Management</strong> → Trust</p>
+              </div>
+              <div class="step">
+                <div class="num">4</div>
+                <p>Open <strong>FileSalvage</strong> from your home screen</p>
+              </div>
+            </div>
+
+            <a class="btn" href="itms-services://?action=download-manifest&url=${PLIST_URL}">
+              Install App
+            </a>
+
+            <p class="note">
+              Open this page in Safari on your iPhone.<br>
+              Chrome and Firefox won't work for OTA install.
+            </p>
+          </body>
+          </html>
+          HTML
+
+          echo "✅ index.html created"
+
+      - name: Copy files to repo root for GitHub Pages
+        run: |
+          cp $RUNNER_TEMP/release/install.plist install.plist
+          cp $RUNNER_TEMP/release/index.html index.html
+
+      - name: Commit install files to repo
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git add install.plist index.html
+          git diff --staged --quiet || git commit -m "Update OTA install files"
+          git push || true
+
+      - name: Create GitHub Release with IPA
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: FileSalvage v1.0.${{ github.run_number }}
+          body: |
+            ## Install on iPhone
+
+            ### Option 1 — Direct Install (Safari only)
+            Open this link on your iPhone in Safari:
+            **https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}**
+
+            ### Option 2 — Sideloadly
+            Download the IPA below and use Sideloadly on Windows.
+
+            ### After install
+            Settings → General → VPN & Device Management → Trust
+          files: ${{ runner.temp }}/FileSalvage.ipa
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload IPA artifact (backup)
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: FileSalvage-IPA
+          path: ${{ runner.temp }}/FileSalvage.ipa
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: build-log
+          path: build.log
+          retention-days: 7
